@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import RandomSampler
 
 import boto3
 from urllib.parse import urlparse
@@ -27,6 +28,7 @@ class TrainerConfig:
     snapshot_path: Optional[str] = None
     save_every: int = None
     use_amp: bool = None
+    use_ddp: bool = None
 
 @dataclass
 class Snapshot:
@@ -46,34 +48,39 @@ class Trainer:
     def __init__(self, trainer_config: TrainerConfig, model, optimizer, train_dataset, test_dataset=None):
         self.config = trainer_config
         # set torchrun variables
-        self.local_rank = int(os.environ["LOCAL_RANK"])
-        self.global_rank = int(os.environ["RANK"])  
+        if self.config.use_ddp:
+            self.local_rank = int(os.environ["LOCAL_RANK"])
+            self.global_rank = int(os.environ["RANK"])  
+            self.model = model.to(self.local_rank)
+            if self.config.use_amp:
+                self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.model = model
         # data stuff
         self.train_dataset = train_dataset
         self.train_loader = self._prepare_dataloader(train_dataset)
         self.test_loader = self._prepare_dataloader(test_dataset) if test_dataset else None
         # initialize train states
         self.epochs_run = 0
-        self.model = model.to(self.local_rank)
         self.optimizer = optimizer        
         self.save_every = self.config.save_every
-        if self.config.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
         # load snapshot if available. only necessary on the first node.
         if self.config.snapshot_path is None:
             self.config.snapshot_path = "snapshot.pt"
         self._load_snapshot()
         # wrap with DDP. this step will synch model across all the processes.
-        self.model = DDP(self.model, device_ids=[self.local_rank])
+        if self.config.use_ddp:
+            self.model = DDP(self.model, device_ids=[self.local_rank])
         
     def _prepare_dataloader(self, dataset: Dataset):
+        sampler = DistributedSampler(dataset) if self.config.use_ddp else RandomSampler(dataset)
         return DataLoader(
             dataset,
             batch_size=self.config.batch_size,
             pin_memory=True,
             shuffle=False,
             num_workers=self.config.data_loader_workers,
-            sampler=DistributedSampler(dataset)
+            sampler=sampler
         )
 
     def _load_snapshot(self):
@@ -111,14 +118,19 @@ class Trainer:
         return loss.item()
 
     def _run_epoch(self, epoch: int, dataloader: DataLoader, train: bool = True):
-        dataloader.sampler.set_epoch(epoch)
+        if self.config.use_ddp:
+            dataloader.sampler.set_epoch(epoch)
         for iter, (source, targets) in enumerate(dataloader):
             step_type = "Train" if train else "Eval"
-            source = source.to(self.local_rank)
-            targets = targets.to(self.local_rank)
+            if self.config.use_ddp:
+                source = source.to(self.local_rank)
+                targets = targets.to(self.local_rank)
             batch_loss = self._run_batch(source, targets, train)
             if iter % 100 == 0:
-                print(f"[GPU{self.global_rank}] Epoch {epoch} | Iter {iter} | {step_type} Loss {batch_loss:.5f}")
+                if self.config.use_ddp:
+                    print(f"[GPU{self.global_rank}] Epoch {epoch} | Iter {iter} | {step_type} Loss {batch_loss:.5f}")
+                else:
+                    print(f"Epoch {epoch} | Iter {iter} | {step_type} Loss {batch_loss:.5f}")
 
     def _save_snapshot(self, epoch):
         # capture snapshot
